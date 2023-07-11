@@ -9,6 +9,7 @@ SQLITE_EXTENSION_INIT1
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <memory>
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
@@ -649,6 +650,7 @@ struct VssIndexColumn {
     sqlite3_int64 dimensions;
     string factory;
     faiss::MetricType metric;
+    unique_ptr<float> metric_arg;
 };
 
 faiss::MetricType parse_metric_type(const std::string& metric_type) {
@@ -713,16 +715,17 @@ unique_ptr<vector<VssIndexColumn>> parse_constructor(int argc,
             factory = string("Flat,IDMap2");
         }
 
-        // FIXME: should non-default factory be required to check for non-default metric type?
-        //        (seems like a yes to me but idk)
         faiss::MetricType metric_type;
         size_t metricStart, metricStringStartFrom;
+        unique_ptr<float> metric_arg_val;
 
         if ((metricStart = arg.find("metric_type", rparen)) != string::npos &&
             (metricStringStartFrom = arg.find("=", metricStart)) != string::npos) {
 
             size_t lquote = arg.find_first_not_of(" ", metricStringStartFrom + 1);
-            size_t rquote = arg.find(",", lquote);
+            size_t comma = arg.find(",", lquote);
+            size_t metric_arg_start = arg.find("(", lquote);
+            size_t rquote = min(comma, metric_arg_start);
 
             if (rquote == string::npos) {
                 rquote = arg.size();
@@ -734,12 +737,27 @@ unique_ptr<vector<VssIndexColumn>> parse_constructor(int argc,
                 throw;
             }
 
+            if (metric_arg_start != string::npos) {
+                size_t metric_arg_end = arg.find(")", metric_arg_start);
+
+                if (metric_arg_end == string::npos) {
+                    throw std::invalid_argument("missing closing parenthesis for metric arg");
+                }
+
+                std::string metric_arg_str = arg.substr(metric_arg_start + 1, metric_arg_end - metric_arg_start - 1);
+                try {
+                    metric_arg_val = unique_ptr<float>(new float(stof(metric_arg_str))); 
+                } catch (const std::invalid_argument& e) {
+                    throw std::invalid_argument("metric arg could not be converted to float: " + metric_arg_str);
+                }
+            }
+
         } else {
             // L2 is the default
             metric_type = faiss::METRIC_L2; 
         }
 
-        columns->push_back(VssIndexColumn{name, dimensions, factory, metric_type});
+        columns->push_back(VssIndexColumn{name, dimensions, factory, metric_type, move(metric_arg_val)});
     }
 
     return columns;
@@ -799,9 +817,12 @@ static int init(sqlite3 *db,
 
         for (auto iter = columns->begin(); iter != columns->end(); ++iter) {
 
-            try {
 
+            try {
                 auto index = faiss::index_factory(iter->dimensions, iter->factory.c_str(), iter->metric);
+                if (iter->metric_arg) {
+                    index->metric_arg = *(iter->metric_arg);
+                }
                 pTable->indexes.push_back(new vss_index(index));
 
             } catch (faiss::FaissException &e) {
